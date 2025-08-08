@@ -1,0 +1,35 @@
+{
+  "name": "google-drive-clone",
+  "version": "1.0.0",
+  "description": "This is a clone of google drive with all of its funtionalities.",
+  "main": "server.js",
+  "scripts": {
+    "start:dev": "nodemon server.js",
+    "start": "node server.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AshishBiswas1/Google-Drive-Clone.git"
+  },
+  "keywords": [
+    "google",
+    "drive",
+    "cloud",
+    "storage"
+  ],
+  "author": "Ashish Biswas",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/AshishBiswas1/Google-Drive-Clone/issues"
+  },
+  "homepage": "https://github.com/AshishBiswas1/Google-Drive-Clone#readme",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.54.0",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.1",
+    "express": "^4.21.2",
+    "jsonwebtoken": "^9.0.2",
+    "morgan": "^1.10.1",
+    "multer": "^2.0.2"
+  }
+}
