@@ -1,6 +1,7 @@
 const supabase = require('../util/supabaseClient');
 const catchAsync = require('./../util/catchAsync');
 const AppError = require('./../util/appError');
+const bcrypt = require('bcryptjs');
 
 exports.getAllUsers = catchAsync(async (req, res, next) => {
   const { data: users, error } = await supabase
@@ -17,12 +18,9 @@ exports.getAllUsers = catchAsync(async (req, res, next) => {
 });
 
 exports.getUser = catchAsync(async (req, res, next) => {
-  const email = req.params.email?.trim().toLowerCase();
+  const id = req.params.id;
 
-  const { data, error } = await supabase
-    .from('User')
-    .select('*')
-    .eq('email', email); // Adjust casing as per your DB
+  const { data, error } = await supabase.from('User').select('*').eq('id', id); // Adjust casing as per your DB
 
   if (error) return next(new AppError('Error fetching user', 500));
   if (!data || data.length === 0)
@@ -45,9 +43,11 @@ exports.createUser = catchAsync(async (req, res, next) => {
     return next(new AppError('Passwords do not match', 400));
   }
 
+  const hashedpassword = await bcrypt.hash(password, 12);
+
   const { data, error: userError } = await supabase
     .from('User')
-    .insert([{ id, name, email, password }]);
+    .insert([{ id, name, email, password: hashedpassword }]);
 
   if (userError) return next(new AppError(userError.message, 400));
 
@@ -59,5 +59,42 @@ exports.createUser = catchAsync(async (req, res, next) => {
   res.status(201).json({
     status: 'success',
     data: { user }
+  });
+});
+
+exports.updateUser = catchAsync(async (req, res, next) => {
+  const id = req.params.id;
+  const name = req.body.name;
+  const email = req.body.email;
+
+  const { data, error } = await supabase
+    .from('User')
+    .update({ name, email })
+    .eq('id', id);
+
+  if (error) return next(new AppError(error.message, 400));
+
+  const { data: user, error: userError } = await supabase
+    .from('User')
+    .select('*')
+    .eq('id', id);
+
+  res.status(200).json({
+    status: 'success',
+    data: {
+      user
+    }
+  });
+});
+
+exports.deleteUser = catchAsync(async (req, res, next) => {
+  const id = req.params.id;
+
+  const { data, error } = await supabase.from('User').delete().eq('id', id);
+
+  if (error) return next(new AppError(error.message, 400));
+
+  res.status(200).json({
+    status: 'success'
   });
 });
