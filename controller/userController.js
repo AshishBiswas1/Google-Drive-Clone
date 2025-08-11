@@ -35,35 +35,29 @@ exports.getUser = catchAsync(async (req, res, next) => {
 });
 
 exports.createUser = catchAsync(async (req, res, next) => {
-  const Name = req.body.name?.trim();
+  const name = req.body.name?.trim();
   const email = req.body.email?.trim();
-  const password = req.body.password;
-  const confirmPassword = req.body.confirmPassword;
+  const password = req.body.password?.trim();
+  const confirmPassword = req.body.confirmPassword?.trim();
+  const id = req.body.id;
 
-  console.log('Email going to Supabase:', JSON.stringify(email));
-  console.log('Password going to Supabase:', password);
-
-  if (password !== confirmPassword)
+  if (password !== confirmPassword) {
     return next(new AppError('Passwords do not match', 400));
+  }
 
-  const { data: authData, error: authError } = await supabase.auth.signUp({
-    email,
-    password,
-    options: { data: { Name } }
-  });
-
-  if (authError) return next(new AppError(authError.message, 400));
-
-  const { data, error } = await supabase
+  const { data, error: userError } = await supabase
     .from('User')
-    .insert([{ id: authData.user.id, Name, email }], {
-      returning: 'representation'
-    });
+    .insert([{ id, name, email, password }]);
 
-  if (error) return next(new AppError(error.message, 500));
+  if (userError) return next(new AppError(userError.message, 400));
+
+  const { data: user, error } = await supabase
+    .from('User')
+    .select('*')
+    .eq('email', email);
 
   res.status(201).json({
     status: 'success',
-    data
+    data: { user }
   });
 });
