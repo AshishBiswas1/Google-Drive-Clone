@@ -3,6 +3,7 @@ const hpp = require('hpp');
 const morgan = require('morgan');
 const helmet = require('helmet');
 const xss = require('xss-clean');
+const cookieParser = require('cookie-parser');
 
 const userRouter = require('./Router/userRouter');
 const globalErrorHandler = require('./controller/errorController');
@@ -17,6 +18,7 @@ if (process.env.NODE_ENV === 'development') {
 app.use(hpp());
 app.use(helmet());
 app.use(xss());
+app.use(cookieParser());
 
 app.use(express.json());
 
