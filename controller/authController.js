@@ -115,14 +115,27 @@ exports.protect = catchAsync(async (req, res, next) => {
   }
 
   // 2) Verify the accessToken if the user still exits
-  const { data, errror } = await supabase.auth.getUser(token);
 
-  if (!data) {
+  const { data: authData, error: authError } = await supabase.auth.getUser(
+    token
+  );
+
+  if (authError || !authData?.user) {
     return next(new AppError('Invalid token or user no longer exists!', 401));
   }
 
+  const userId = authData.user.id;
+
+  const { data: userData, error: userError } = await supabase
+    .from('User')
+    .select('*')
+    .eq('id', userId)
+    .single();
+
+  if (userError) return next(new AppError(userError.message, 400));
+
   // 3)Attach the user to the request
-  req.user = data.user;
+  req.user = userData;
 
   next();
 });
@@ -215,4 +228,65 @@ exports.resetPassword = catchAsync(async (req, res, next) => {
     status: 'success',
     message: 'Password reset successfully'
   });
+});
+
+exports.updatePassword = catchAsync(async (req, res, next) => {
+  const { currentPassword, newPassword, confirmPassword } = req.body;
+
+  if (!currentPassword || !newPassword || !confirmPassword) {
+    return next(new AppError('Please provide all required fields', 400));
+  }
+
+  // If passwords do not match
+  if (newPassword !== confirmPassword) {
+    return next(
+      new AppError('NewPassword and confirmPassword do not match', 400)
+    );
+  }
+
+  // Create a temporary client session (no persisting)
+  const tempSupabase = createClient(
+    process.env.SUPABASE_URL,
+    process.env.SUPABASE_KEY,
+    { auth: { persistSession: false } }
+  );
+
+  // 1. Verify current password by logging in with it
+  const { data: loginData, error: verifyError } =
+    await tempSupabase.auth.signInWithPassword({
+      email: req.user.email,
+      password: currentPassword
+    });
+
+  if (verifyError) {
+    return next(new AppError('Current password is incorrect', 400));
+  }
+
+  // 2. Update the password using the session from tempSupabase
+  const { error: updateError } = await tempSupabase.auth.updateUser({
+    password: newPassword
+  });
+
+  if (updateError) {
+    return next(new AppError(updateError.message, 400));
+  }
+
+  // 3. Sign in again with the new password to get a fresh token
+  const { data: newSessionData, error: signInError } =
+    await tempSupabase.auth.signInWithPassword({
+      email: req.user.email,
+      password: newPassword
+    });
+
+  if (signInError) {
+    return next(
+      new AppError('Password updated, but failed to sign in again', 400)
+    );
+  }
+
+  // 4. Send fresh token & user
+  const accessToken = newSessionData.session?.access_token || null;
+  const user = newSessionData.user;
+
+  createSendToken(user, accessToken, 200, res);
 });

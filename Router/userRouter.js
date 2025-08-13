@@ -12,6 +12,13 @@ router.route('/login').post(authController.login);
 router.route('/forgetPassword').post(authController.forgetPassword);
 router.route('/resetPassword').post(authController.resetPassword);
 
+router.use(authController.protect);
+router.route('/updatePassword').post(authController.updatePassword);
+router.route('/me').get(userController.getMe, userController.getUser);
+
+router.route('/updateMe').patch(userController.updateMe);
+router.route('/deleteMe').delete(userController.deleteMe);
+
 router.use(authController.protect, authController.restrictTo('admin'));
 
 router
