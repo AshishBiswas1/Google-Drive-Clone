@@ -13,4 +13,6 @@ router
     userDocController.uploadUserDocs
   );
 
+router.route('/getDocs').get(userDocController.getUserDocs);
+
 module.exports = router;

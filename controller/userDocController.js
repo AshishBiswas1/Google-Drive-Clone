@@ -76,3 +76,20 @@ exports.uploadUserDocs = catchAsync(async (req, res, next) => {
     data: { uploadedFiles: uploadResult }
   });
 });
+
+exports.getUserDocs = catchAsync(async (req, res, next) => {
+  const { data: userDocs, error: userDocsError } = await supabase
+    .from('UserDocuments')
+    .select('*')
+    .eq('uid', req.user.id)
+    .order('uploaded_at', { ascending: false });
+
+  if (userDocsError) {
+    return next(new AppError(userDocsError.message, 400));
+  }
+
+  res.status(200).json({
+    status: 'success',
+    data: { userDocs }
+  });
+});
