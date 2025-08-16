@@ -13,6 +13,9 @@ router
     userDocController.uploadUserDocs
   );
 
+router.route('/openDoc/:docId').get(userDocController.openUserDocument);
+router.route('/download/:docId').get(userDocController.downloadUserDoc);
+
 router.route('/getDocs').get(userDocController.getUserDocs);
 
 module.exports = router;
