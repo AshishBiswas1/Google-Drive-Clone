@@ -6,6 +6,10 @@ const router = express.Router();
 
 router.use(authController.protect);
 
+router.route('/share').post(userDocController.shareUserDocument);
+
+router.route('/share/:shareId').get(userDocController.accessSharedDoc);
+
 router
   .route('/upload')
   .post(

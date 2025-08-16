@@ -3,6 +3,11 @@ const multer = require('multer');
 const catchAsync = require('./../util/catchAsync');
 const AppError = require('./../util/appError');
 const path = require('path');
+const { v4: uuidv4 } = require('uuid');
+
+function generateShareLink(shareLink) {
+  return `/api/drive/docs/share/${shareLink}`;
+}
 
 async function getSignedUrlForDoc(userId, docId, expirySeconds = 60 * 10) {
   const { data: doc, error: fetchError } = await supabase
@@ -210,4 +215,101 @@ exports.downloadUserDoc = catchAsync(async (req, res, next) => {
   const { doc, signedUrl } = result;
 
   res.redirect(signedUrl);
+});
+
+exports.shareUserDocument = catchAsync(async (req, res, next) => {
+  const userId = req.user.id;
+  const docId = req.body.docId;
+  const shareType = req.body.shareType;
+
+  if (!docId || !shareType) {
+    return next(new AppError('Document Id and Share Type is required', 400));
+  }
+
+  if (!['restricted', 'Anyone with link'].includes(shareType)) {
+    return next(
+      new AppError('shareType must be "restricted" or "Anyone with link"', 400)
+    );
+  }
+
+  const { data: doc, error: fetchError } = await supabase
+    .from('UserDocuments')
+    .select('*')
+    .eq('id', docId)
+    .eq('uid', userId)
+    .single();
+
+  if (fetchError || !doc) {
+    return next(new AppError('Document not found or unauthorized', 403));
+  }
+
+  const shareId = uuidv4();
+  const { error: shareError } = await supabase.from('documentshares').insert([
+    {
+      id: shareId,
+      doc_id: docId,
+      uid: userId,
+      share_type: shareType
+    }
+  ]);
+
+  if (shareError) {
+    return next(new AppError('Unable to create share link', 500));
+  }
+
+  const shareLink = generateShareLink(shareId);
+
+  res.status(201).json({
+    status: 'success',
+    shareLink,
+    shareType,
+    info:
+      shareType === 'restricted'
+        ? 'Recipients must request access'
+        : 'Anyone with link can view/read/download'
+  });
+});
+
+exports.accessSharedDoc = catchAsync(async (req, res, next) => {
+  const shareId = req.params.shareId;
+
+  const { data: share, error: shareError } = await supabase
+    .from('documentshares')
+    .select('*')
+    .eq('id', shareId)
+    .single();
+
+  if (shareError || !share) {
+    return next(new AppError('Invalid or expired share link', 404));
+  }
+
+  const { data: doc, error: docError } = await supabase
+    .from('UserDocuments')
+    .select('*')
+    .eq('id', share.doc_id)
+    .single();
+
+  if (docError || !doc) {
+    return next(new AppError('Document not found', 404));
+  }
+
+  if (share.share_type === 'restricted') {
+    return next(new AppError('Access Restricted, request required', 401));
+  }
+
+  const { data: signedUrl, error: urlError } = await supabase.storage
+    .from('User-Documents')
+    .createSignedUrl(doc.path_of_file, 60 * 3);
+
+  if (urlError || !signedUrl?.signedUrl) {
+    return next(new AppError('Unable to generate file access URL.', 400));
+  }
+
+  res.status(200).json({
+    status: 'success',
+    docId: doc.id,
+    fileName: doc.fileName,
+    viewUrl: signedUrl.signedUrl,
+    info: 'Anyone with this link has read-only access'
+  });
 });
