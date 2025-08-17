@@ -9,6 +9,86 @@ function generateShareLink(shareLink) {
   return `/api/drive/docs/share/${shareLink}`;
 }
 
+async function moveToTrash(supabase, userId, doc) {
+  if (!doc || doc.uid !== userId) return { error: 'unauthorized' };
+
+  const bucket = 'User-Documents';
+
+  // Normalize and validate the source key
+  const srcPathRaw = doc.path_of_file;
+  const srcPath =
+    typeof srcPathRaw === 'string' ? srcPathRaw.replace(/^\/+/, '').trim() : '';
+
+  if (!srcPath) return { error: 'invalid_path', detail: 'Empty path_of_file' };
+
+  // Destination: trash/<userId>/<original path>
+  const distPath = `trash/${userId}/${srcPath}`;
+
+  console.log('[moveToTrash] srcPath:', srcPath);
+  console.log('[moveToTrash] distPath:', distPath);
+
+  // Optional: probe existence to give clearer errors
+  const probe = await supabase.storage
+    .from(bucket)
+    .createSignedUrl(srcPath, 30);
+
+  if (probe.error || !probe.data?.signedUrl) {
+    return { error: 'object_not_found', detail: `No object at ${srcPath}` };
+  }
+
+  // 1) Copy within same bucket
+  const { error: copyError } = await supabase.storage
+    .from(bucket)
+    .copy(srcPath, distPath);
+
+  if (copyError) {
+    return {
+      error: 'copy_failed',
+      detail: `${copyError.message} (from: ${srcPath} to: ${distPath})`
+    };
+  }
+
+  // 2) Remove original
+  const { error: removeError } = await supabase.storage
+    .from(bucket)
+    .remove([srcPath]);
+
+  if (removeError) {
+    // Attempt rollback of the copy
+    await supabase.storage
+      .from(bucket)
+      .remove([distPath])
+      .catch(() => {});
+    return { error: 'remove_failed', detail: removeError.message };
+  }
+
+  // 3) Update DB
+  const { error: dbError } = await supabase
+    .from('UserDocuments')
+    .update({
+      status: 'trashed',
+      trash_path: distPath
+    })
+    .eq('id', doc.id)
+    .eq('uid', userId);
+
+  if (dbError) {
+    return {
+      ok: true,
+      warning: 'db_update_failed',
+      detail: dbError.message,
+      fileName: path.basename(srcPath),
+      trashPath: distPath
+    };
+  }
+
+  return {
+    ok: true,
+    fileName: path.basename(srcPath),
+    trashPath: distPath
+  };
+}
+
 async function getSignedUrlForDoc(userId, docId, expirySeconds = 60 * 10) {
   const { data: doc, error: fetchError } = await supabase
     .from('UserDocuments')
@@ -311,5 +391,400 @@ exports.accessSharedDoc = catchAsync(async (req, res, next) => {
     fileName: doc.fileName,
     viewUrl: signedUrl.signedUrl,
     info: 'Anyone with this link has read-only access'
+  });
+});
+
+exports.deleteUserDocTemp = catchAsync(async (req, res, next) => {
+  const userId = req.user.id;
+
+  const singleId = req.params.docId;
+  const csvIds = req.params.docIds;
+
+  if (!singleId && !csvIds) {
+    return next(
+      new AppError(
+        'Provide a document id in params (/:docId) or a CSV list (/:ids)',
+        400
+      )
+    );
+  }
+
+  if (singleId && csvIds) {
+    return next(new AppError('Provide either /:docId or /:ids, not both', 400));
+  }
+
+  if (singleId) {
+    const { data: doc, error: fetchError } = await supabase
+      .from('UserDocuments')
+      .select('*')
+      .eq('id', singleId)
+      .eq('uid', userId)
+      .single();
+
+    if (fetchError || !doc) {
+      return next(new AppError('Document not found or unauthorized', 404));
+    }
+
+    if (doc.status === 'trashed') {
+      return res.status(200).json({
+        status: 'success',
+        message: 'Document already trashed',
+        fileName: doc.fileName,
+        trashPath: doc.trash_path || null,
+        skipped: true
+      });
+    }
+
+    const result = await moveToTrash(supabase, userId, doc);
+
+    if (result.error === 'unauthorized') {
+      return next(new AppError('Unauthorized', 403));
+    }
+
+    if (result.error) {
+      return next(
+        new AppError(
+          `Move to trash failed: ${result.error} ${result.detail || ''}`,
+          500
+        )
+      );
+    }
+
+    return res.status(200).json({
+      status: 'success',
+      message: 'Document moved to Trash',
+      fileName: result.fileName,
+      trashPath: result.trashPath,
+      warning: result.warning || null
+    });
+  }
+
+  const ids = csvIds
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  if (ids.length === 0) {
+    return next(new AppError('No valid IDs provided in params', 400));
+  }
+
+  const { data: docs, error: fetchError } = await supabase
+    .from('UserDocuments')
+    .select('*')
+    .in('id', ids)
+    .eq('uid', userId);
+
+  if (fetchError) {
+    return next(new AppError('Error fetching documents', 500));
+  }
+  if (!docs || docs.length === 0) {
+    return next(new AppError('No documents found or unauthorized', 404));
+  }
+
+  const foundIds = new Set(docs.map((d) => d.id));
+  const missingIds = ids.filter((id) => !foundIds.has(id));
+
+  const results = [];
+
+  for (const doc of docs) {
+    if (doc.status === 'trashed') {
+      results.push({ id: doc.id, skipped: true, reason: 'already_trashed' });
+      continue;
+    }
+
+    const r = await moveToTrash(supabase, userId, doc);
+    results.push({ id: doc.id, ...r });
+  }
+
+  return res.status(200).json({
+    status: 'success',
+    missingIds,
+    results
+  });
+});
+
+exports.getdeletedDocs = catchAsync(async (req, res, next) => {
+  const userId = req.user.id;
+
+  const { data: docs, error: fetchError } = await supabase
+    .from('UserDocuments')
+    .select('*')
+    .eq('uid', userId)
+    .eq('status', 'trashed')
+    .eq('permanently_deleted', false);
+
+  if (fetchError) {
+    return next(new AppError('Error fetching deleted documents', 500));
+  }
+
+  res.status(200).json({
+    status: 'success',
+    data: { docs }
+  });
+});
+
+exports.permanentlyDeleteDocs = catchAsync(async (req, res, next) => {
+  const userId = req.user.id;
+  const singleId = req.params.docId;
+  const csvIds = req.params.docIds;
+
+  if (!singleId && !csvIds) {
+    return next(
+      new AppError(
+        'Provide a document id in params (/:docId) or a CSV list (/:docIds)',
+        400
+      )
+    );
+  }
+  if (singleId && csvIds) {
+    return next(
+      new AppError('Provide either /:docId or /:docIds, not both', 400)
+    );
+  }
+
+  const ids = singleId
+    ? [singleId]
+    : (csvIds || '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+
+  if (ids.length === 0) {
+    return next(new AppError('No valid IDs provided in params', 400));
+  }
+
+  const { data: docs, error: fetchError } = await supabase
+    .from('UserDocuments')
+    .select('*')
+    .in('id', ids)
+    .eq('uid', userId);
+
+  if (fetchError) {
+    return next(
+      new AppError(`Error fetching documents: ${fetchError.message}`, 500)
+    );
+  }
+  if (!docs || docs.length === 0) {
+    return next(new AppError('No documents found or unauthorized', 404));
+  }
+
+  const bucket = 'User-Documents';
+  const results = [];
+  const foundSet = new Set(docs.map((d) => d.id));
+  const missingIds = ids.filter((x) => !foundSet.has(x));
+
+  for (const doc of docs) {
+    try {
+      // Must be in trashed state and have a trash_path
+      if (doc.status !== 'trashed' || !doc.trash_path) {
+        results.push({
+          id: doc.id,
+          skipped: true,
+          reason:
+            doc.status !== 'trashed' ? 'not_trashed' : 'missing_trash_path'
+        });
+        continue;
+      }
+
+      const storageKey = String(doc.trash_path).replace(/^\/+/, '').trim();
+      if (!storageKey) {
+        results.push({ id: doc.id, error: 'invalid_trash_path' });
+        continue;
+      }
+
+      // Remove object from storage
+      const { error: rmErr } = await supabase.storage
+        .from(bucket)
+        .remove([storageKey]);
+
+      if (rmErr) {
+        // If object is already gone, still mark DB as permanently deleted,
+        // but record the storage error in results for visibility.
+        results.push({
+          id: doc.id,
+          warning: 'storage_remove_failed',
+          detail: rmErr.message,
+          storageKey
+        });
+      } else {
+        results.push({ id: doc.id, ok: true, removed: storageKey });
+      }
+
+      const { error: delErr } = await supabase
+        .from('UserDocuments')
+        .delete()
+        .eq('id', doc.id)
+        .eq('uid', userId);
+
+      if (delErr) {
+        results.push({
+          id: doc.id,
+          warning: 'db_row_delete_failed',
+          detail: delErr.message
+        });
+      }
+    } catch (e) {
+      results.push({ id: doc.id, error: 'exception', detail: e?.message });
+    }
+  }
+
+  return res.status(200).json({
+    status: 'success',
+    missingIds, // requested but not found/unauthorized
+    results
+  });
+});
+
+exports.restoreUserDoc = catchAsync(async (req, res, next) => {
+  const userId = req.user.id;
+
+  const singleId = req.params.docId;
+  const csvIds = req.params.docIds;
+
+  if (!singleId && !csvIds) {
+    return next(
+      new AppError(
+        'Provide a document id in params (/:docId) or a CSV list (/:docIds)',
+        400
+      )
+    );
+  }
+  if (singleId && csvIds) {
+    return next(
+      new AppError('Provide either /:docId or /:docIds, not both', 400)
+    );
+  }
+
+  const ids = singleId
+    ? [singleId]
+    : (csvIds || '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+
+  if (ids.length === 0) {
+    return next(new AppError('No valid IDs provided in params', 400));
+  }
+
+  const { data: docs, error: fetchError } = await supabase
+    .from('UserDocuments')
+    .select('*')
+    .in('id', ids)
+    .eq('uid', userId);
+
+  if (fetchError) {
+    return next(
+      new AppError(`Error fetching documents: ${fetchError.message}`, 500)
+    );
+  }
+  if (!docs || docs.length === 0) {
+    return next(new AppError('No documents found or unauthorized', 404));
+  }
+
+  const bucket = 'User-Documents';
+  const results = [];
+  const foundSet = new Set(docs.map((d) => d.id));
+  const missingIds = ids.filter((x) => !foundSet.has(x));
+
+  for (const doc of docs) {
+    try {
+      // Must be trashed and have trash_path
+      if (doc.status !== 'trashed') {
+        results.push({ id: doc.id, skipped: true, reason: 'not_trashed' });
+        continue;
+      }
+      if (!doc.trash_path) {
+        results.push({
+          id: doc.id,
+          skipped: true,
+          reason: 'missing_trash_path'
+        });
+        continue;
+      }
+
+      // Determine source (in trash) and destination (original path)
+      const srcTrashKey = String(doc.trash_path).replace(/^\/+/, '').trim(); // e.g., 'trash/<uid>/documents/<uid>/<file>'
+      let dstOriginalKey = null;
+
+      if (doc.path_of_file) {
+        dstOriginalKey = String(doc.path_of_file).replace(/^\/+/, '').trim();
+      } else {
+        // If you cleared path_of_file during trash, reconstruct it:
+        // If your trash path is 'trash/<uid>/documents/<uid>/<file>', stripping 'trash/<uid>/' yields the original.
+        // Note: ensure your trash_path format strictly follows 'trash/<uid>/<original key>'.
+        const prefix = `trash/${userId}/`;
+        if (srcTrashKey.startsWith(prefix)) {
+          dstOriginalKey = srcTrashKey.slice(prefix.length);
+        } else {
+          results.push({
+            id: doc.id,
+            error: 'cannot_reconstruct_original_path',
+            trash_path: doc.trash_path
+          });
+          continue;
+        }
+      }
+
+      if (!dstOriginalKey) {
+        results.push({ id: doc.id, error: 'invalid_original_path' });
+        continue;
+      }
+
+      // 1) Copy from trash back to original
+      const { error: copyErr } = await supabase.storage
+        .from(bucket)
+        .copy(srcTrashKey, dstOriginalKey);
+
+      if (copyErr) {
+        results.push({
+          id: doc.id,
+          error: 'copy_failed',
+          detail: `${copyErr.message} (from: ${srcTrashKey} to: ${dstOriginalKey})`
+        });
+        continue;
+      }
+
+      const { error: removeErr } = await supabase.storage
+        .from(bucket)
+        .remove([srcTrashKey]);
+
+      if (removeErr) {
+        // Not fatal to user experience, but report
+        results.push({
+          id: doc.id,
+          warning: 'trash_remove_failed',
+          detail: removeErr.message,
+          keptAt: dstOriginalKey
+        });
+      }
+
+      const { error: updErr } = await supabase
+        .from('UserDocuments')
+        .update({
+          status: 'active', // or whatever your active status is
+          path_of_file: dstOriginalKey, // ensure DB matches the restored location
+          trash_path: null
+        })
+        .eq('id', doc.id)
+        .eq('uid', userId);
+
+      if (updErr) {
+        results.push({
+          id: doc.id,
+          warning: 'db_update_failed',
+          detail: updErr.message
+        });
+      } else {
+        results.push({ id: doc.id, ok: true, restoredTo: dstOriginalKey });
+      }
+    } catch (e) {
+      results.push({ id: doc.id, error: 'exception', detail: e?.message });
+    }
+  }
+
+  return res.status(200).json({
+    status: 'success',
+    missingIds,
+    results
   });
 });
