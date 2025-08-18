@@ -34,6 +34,8 @@ router.route('/restore/:docId').post(userDocController.restoreUserDoc);
 // restore multiple deleted files
 router.route('/restore/batch/:docIds').post(userDocController.restoreUserDoc);
 
+router.route('/rename/:docId').patch(userDocController.renameUserDoc);
+
 router.route('/getDeleted').get(userDocController.getdeletedDocs);
 
 router

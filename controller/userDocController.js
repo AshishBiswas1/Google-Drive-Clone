@@ -788,3 +788,138 @@ exports.restoreUserDoc = catchAsync(async (req, res, next) => {
     results
   });
 });
+
+exports.renameUserDoc = catchAsync(async (req, res, next) => {
+  const userId = req.user.id;
+  const docId = req.params.docId;
+  const newNameRaw = req.body?.newName;
+
+  if (!docId) {
+    return next(new AppError('Document Id is required in params', 400));
+  }
+  if (!newNameRaw || typeof newNameRaw !== 'string') {
+    return next(new AppError('newName (string) is required in body', 400));
+  }
+
+  // Clean/sanitize the new name: prevent leading slashes and whitespace
+  const newName = newNameRaw.replace(/[/\\]+/g, '_').trim();
+  if (!newName) {
+    return next(
+      new AppError('newName cannot be empty after sanitization', 400)
+    );
+  }
+
+  // Fetch document and verify ownership
+  const { data: doc, error: fetchError } = await supabase
+    .from('UserDocuments')
+    .select('*')
+    .eq('id', docId)
+    .eq('uid', userId)
+    .single();
+
+  if (fetchError || !doc) {
+    return next(new AppError('Document not found or unauthorized', 404));
+  }
+
+  // If the doc is trashed, you might block renaming or allow it in trash; choose policy
+  if (doc.status === 'trashed') {
+    return next(
+      new AppError('Cannot rename a trashed file. Restore it first.', 400)
+    );
+  }
+
+  // Old storage key and new storage key
+  const bucket = 'User-Documents';
+  const oldKey = String(doc.path_of_file || '')
+    .replace(/^\/+/, '')
+    .trim();
+
+  if (!oldKey) {
+    return next(
+      new AppError('Invalid stored path_of_file for this document', 400)
+    );
+  }
+
+  // Compute destination key: keep the same folder, change only the filename
+  // Example: documents/<uid>/<oldName> -> documents/<uid>/<newName>
+  const dir = path.posix.dirname(oldKey); // use posix for URL-like paths
+  const newKey = `${dir}/${newName}`;
+
+  // If no change, short-circuit
+  if (oldKey === newKey) {
+    return res.status(200).json({
+      status: 'success',
+      message: 'Name unchanged',
+      fileName: doc.fileName,
+      path_of_file: doc.path_of_file
+    });
+  }
+
+  // 1) Optional: probe old object exists (for clearer error)
+  const probe = await supabase.storage.from(bucket).createSignedUrl(oldKey, 30);
+  if (probe.error || !probe.data?.signedUrl) {
+    return next(new AppError(`Source object not found at ${oldKey}`, 404));
+  }
+
+  // 2) Copy old object to new key
+  const { error: copyError } = await supabase.storage
+    .from(bucket)
+    .copy(oldKey, newKey);
+
+  if (copyError) {
+    return next(
+      new AppError(
+        `Rename failed during copy: ${copyError.message} (from: ${oldKey} to: ${newKey})`,
+        500
+      )
+    );
+  }
+
+  // 3) Remove old object
+  const { error: removeError } = await supabase.storage
+    .from(bucket)
+    .remove([oldKey]);
+
+  if (removeError) {
+    // Try to rollback by removing new copy to avoid duplicates
+    await supabase.storage
+      .from(bucket)
+      .remove([newKey])
+      .catch(() => {});
+    return next(
+      new AppError(`Rename failed during remove: ${removeError.message}`, 500)
+    );
+  }
+
+  // 4) Update DB: fileName + path_of_file
+  const { error: dbError } = await supabase
+    .from('UserDocuments')
+    .update({
+      fileName: newName,
+      path_of_file: newKey,
+      updated_at: new Date().toISOString()
+    })
+    .eq('id', doc.id)
+    .eq('uid', userId);
+
+  if (dbError) {
+    // Storage already moved; try to roll back storage to oldKey
+    const rbCopy = await supabase.storage.from(bucket).copy(newKey, oldKey);
+    if (!rbCopy.error) {
+      await supabase.storage
+        .from(bucket)
+        .remove([newKey])
+        .catch(() => {});
+    }
+    return next(
+      new AppError(`Database update failed: ${dbError.message}`, 500)
+    );
+  }
+
+  return res.status(200).json({
+    status: 'success',
+    message: 'File renamed successfully',
+    old: { fileName: doc.fileName, path_of_file: oldKey },
+    updated: { fileName: newName, path_of_file: newKey }
+  });
+});
