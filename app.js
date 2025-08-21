@@ -15,7 +15,7 @@ const app = express();
 
 app.use(
   cors({
-    origin: 'http://localhost:3000',
+    origin: 'google-drive-clone-frontend-smoky.vercel.app',
     credentials: true,
     methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization']
