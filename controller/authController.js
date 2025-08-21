@@ -3,19 +3,37 @@ const catchAsync = require('./../util/catchAsync');
 const AppError = require('./../util/appError');
 const { createClient } = require('@supabase/supabase-js');
 
-const createSendToken = (user, access_token, statusCode, res) => {
-  const cookieOptions = {
-    expires: new Date(
-      Date.now() + process.env.JWT_COOKIE_EXPIRES_IN * 24 * 60 * 60 * 1000
-    ),
-    httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: 'lax',
-    path: '/',
-    maxAge: 7 * 24 * 60 * 60 * 1000
-  };
+const isProd = process.env.NODE_ENV === 'production';
 
-  if (process.env.NODE_ENV === 'production') cookieOptions.secure = true;
+// Centralized cookie options for setting auth cookie
+function getAuthCookieOptions(maxAgeMs) {
+  return {
+    httpOnly: true,
+    secure: isProd ? true : false, // true in prod (HTTPS)
+    sameSite: isProd ? 'none' : 'lax', // cross-site requires "none"
+    path: '/',
+    maxAge: maxAgeMs,
+    expires: new Date(Date.now() + maxAgeMs)
+  };
+}
+
+// Centralized cookie options for clearing auth cookie (MUST MATCH)
+function getClearCookieOptions() {
+  return {
+    httpOnly: true,
+    secure: isProd ? true : false,
+    sameSite: isProd ? 'none' : 'lax',
+    path: '/',
+    maxAge: 0,
+    expires: new Date(0)
+  };
+}
+
+const createSendToken = (user, access_token, statusCode, res) => {
+  const maxAge = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+  // Use cross-site-safe options
+  const cookieOptions = getAuthCookieOptions(maxAge);
 
   res.cookie('jwt', access_token, cookieOptions);
 
@@ -44,29 +62,25 @@ exports.signup = catchAsync(async (req, res, next) => {
     email: email,
     password: password,
     options: {
-      data: {
-        display_name: name
-      }
+      data: { display_name: name }
     }
   });
 
-  if (authError) {
-    return next(new AppError(authError.message, 400));
-  }
+  if (authError) return next(new AppError(authError.message, 400));
 
   const user = authuser.user;
   const filteredUser = {
     id: user.id,
     email: user.email,
-    name: user.user_metadata.display_name || null // or display_name if you used that
+    name: user.user_metadata.display_name || null
   };
+
   const id = user.id;
   const accessToken = authuser.session?.access_token || null;
 
   const { error: userError } = await supabase
     .from('User')
     .insert([{ id, name, email }]);
-
   if (userError) return next(new AppError(userError.message, 400));
 
   createSendToken(filteredUser, accessToken, 201, res);
@@ -86,20 +100,15 @@ exports.login = catchAsync(async (req, res, next) => {
       password
     });
 
-  if (loginError) {
-    return next(new AppError(loginError.message, 400));
-  }
+  if (loginError) return next(new AppError(loginError.message, 400));
 
   const user = loginData.user;
-
-  if (!user) {
-    return next(new AppError('User not found', 400));
-  }
+  if (!user) return next(new AppError('User not found', 400));
 
   const filteredUser = {
     id: user.id,
     email: user.email,
-    name: user.user_metadata.display_name || null // or display_name if you used that
+    name: user.user_metadata.display_name || null
   };
 
   const accessToken = loginData.session?.access_token || null;
@@ -107,9 +116,8 @@ exports.login = catchAsync(async (req, res, next) => {
   createSendToken(filteredUser, accessToken, 200, res);
 });
 
-// This will allow to protect routes which require login
+// Protect middleware
 exports.protect = catchAsync(async (req, res, next) => {
-  // 1) Get the accessToken from the cookies
   const token = req.cookies?.jwt;
 
   if (!token) {
@@ -117,8 +125,6 @@ exports.protect = catchAsync(async (req, res, next) => {
       new AppError('You not logged in! Please login to get access', 401)
     );
   }
-
-  // 2) Verify the accessToken if the user still exits
 
   const { data: authData, error: authError } = await supabase.auth.getUser(
     token
@@ -138,13 +144,10 @@ exports.protect = catchAsync(async (req, res, next) => {
 
   if (userError) return next(new AppError(userError.message, 400));
 
-  // 3)Attach the user to the request
   req.user = userData;
-
   next();
 });
 
-// This will help to allow only certain users to access specific routes
 exports.restrictTo = (...roles) => {
   return (req, res, next) => {
     if (!roles.includes(req.user.Role)) {
@@ -155,36 +158,31 @@ exports.restrictTo = (...roles) => {
         )
       );
     }
-
     next();
   };
 };
 
 exports.forgetPassword = catchAsync(async (req, res, next) => {
   const email = req.body.email;
-
-  if (!email) {
-    return next(new AppError('Please provide email', 400));
-  }
+  if (!email) return next(new AppError('Please provide email', 400));
 
   const { error } = await supabase.auth.resetPasswordForEmail(email, {
-    redirectTo: 'http://localhost:8000/api/drive/user/resetPassword'
+    // In production, set this to a deployed frontend URL
+    redirectTo:
+      process.env.RESET_REDIRECT_URL ||
+      'http://localhost:8000/api/drive/user/resetPassword'
   });
 
-  if (error) {
-    return next(new AppError(error.message, 400));
-  }
+  if (error) return next(new AppError(error.message, 400));
 
   res.status(200).json({
     status: 'success',
-    data: {
-      message: 'Please check your email to reset your password'
-    }
+    data: { message: 'Please check your email to reset your password' }
   });
 });
 
 exports.resetPassword = catchAsync(async (req, res, next) => {
-  const { token, password, confirmPassword } = req.body;
+  const { token, password, confirmPassword, refresh_token } = req.body;
 
   if (!token || !password || !confirmPassword) {
     return next(
@@ -196,42 +194,37 @@ exports.resetPassword = catchAsync(async (req, res, next) => {
     return next(new AppError('Passwords do not match', 400));
   }
 
-  // 1. Temporarily create a supabase client without session persistence
   const tempSupabase = createClient(
     process.env.SUPABASE_URL,
     process.env.SUPABASE_KEY,
-    { auth: { persistSession: false } }
+    {
+      auth: { persistSession: false }
+    }
   );
 
-  // 2. Authenticate using the recovery token to establish a session
   const { data: sessionData, error: signInError } =
     await tempSupabase.auth.setSession({
-      access_token: token, // from req.body.token
-      refresh_token: req.body.refresh_token // new — from request body
+      access_token: token,
+      refresh_token
     });
 
   if (signInError || !sessionData) {
     return next(new AppError('Invalid or expired token.', 400));
   }
 
-  // 3. Use the temporary authenticated client to update the password
   const { error: updateError } = await tempSupabase.auth.updateUser({
     password
   });
-
-  if (updateError) {
+  if (updateError)
     return next(
       new AppError('Failed to update password: ' + updateError.message, 400)
     );
-  }
 
-  // 4. Optionally sign out the temporary session for cleanup
   await tempSupabase.auth.signOut();
 
-  res.status(200).json({
-    status: 'success',
-    message: 'Password reset successfully'
-  });
+  res
+    .status(200)
+    .json({ status: 'success', message: 'Password reset successfully' });
 });
 
 exports.updatePassword = catchAsync(async (req, res, next) => {
@@ -241,41 +234,34 @@ exports.updatePassword = catchAsync(async (req, res, next) => {
     return next(new AppError('Please provide all required fields', 400));
   }
 
-  // If passwords do not match
   if (newPassword !== confirmPassword) {
     return next(
       new AppError('NewPassword and confirmPassword do not match', 400)
     );
   }
 
-  // Create a temporary client session (no persisting)
   const tempSupabase = createClient(
     process.env.SUPABASE_URL,
     process.env.SUPABASE_KEY,
-    { auth: { persistSession: false } }
+    {
+      auth: { persistSession: false }
+    }
   );
 
-  // 1. Verify current password by logging in with it
-  const { data: loginData, error: verifyError } =
-    await tempSupabase.auth.signInWithPassword({
-      email: req.user.email,
-      password: currentPassword
-    });
+  const { error: verifyError } = await tempSupabase.auth.signInWithPassword({
+    email: req.user.email,
+    password: currentPassword
+  });
 
-  if (verifyError) {
+  if (verifyError)
     return next(new AppError('Current password is incorrect', 400));
-  }
 
-  // 2. Update the password using the session from tempSupabase
   const { error: updateError } = await tempSupabase.auth.updateUser({
     password: newPassword
   });
 
-  if (updateError) {
-    return next(new AppError(updateError.message, 400));
-  }
+  if (updateError) return next(new AppError(updateError.message, 400));
 
-  // 3. Sign in again with the new password to get a fresh token
   const { data: newSessionData, error: signInError } =
     await tempSupabase.auth.signInWithPassword({
       email: req.user.email,
@@ -288,7 +274,6 @@ exports.updatePassword = catchAsync(async (req, res, next) => {
     );
   }
 
-  // 4. Send fresh token & user
   const accessToken = newSessionData.session?.access_token || null;
   const user = newSessionData.user;
 
@@ -296,13 +281,7 @@ exports.updatePassword = catchAsync(async (req, res, next) => {
 });
 
 exports.logout = catchAsync(async (req, res, next) => {
-  res.cookie('jwt', '', {
-    httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: 'lax',
-    path: '/',
-    maxAge: 0
-  });
-
+  // Clear using identical attributes as set
+  res.cookie('jwt', '', getClearCookieOptions());
   return res.status(200).json({ status: 'success', message: 'Logged out' });
 });
