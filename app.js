@@ -46,6 +46,14 @@ app.use(cookieParser());
 
 app.use(express.json());
 
+// For keeping the service on render on
+app.get('/', (req, res) => {
+  res.status(200).json({
+    status: 'success',
+    message: 'Welcome to Google Drive Clone API'
+  });
+});
+
 app.use('/api/drive/user', userRouter);
 app.use('/api/drive/docs', userDocumentRouter);
 
