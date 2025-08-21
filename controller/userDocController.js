@@ -2,12 +2,45 @@ const supabase = require('./../util/supabaseClient');
 const multer = require('multer');
 const catchAsync = require('./../util/catchAsync');
 const AppError = require('./../util/appError');
-const { getSignedUrlForDoc } = require('./../util/getSignedUrlForDoc');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 
+// ===================== Helpers =====================
+
 function generateShareLink(shareLink) {
   return `/api/drive/docs/share/${shareLink}`;
+}
+
+async function getSignedUrlForDoc(userId, docId, ttlSeconds = 600) {
+  // 1) Fetch doc row
+  const { data: doc, error: docErr } = await supabase
+    .from('UserDocuments')
+    .select('id, uid, fileName, path_of_file, status')
+    .eq('id', docId)
+    .single();
+
+  if (docErr || !doc) return { error: 'Not_found' };
+  if (doc.uid !== userId) return { error: 'Not_found' }; // unauthorized behaves as not found
+  if (doc.status === 'trashed') return { error: 'Not_found' };
+
+  // 2) Validate storage key
+  const key = String(doc.path_of_file || '')
+    .replace(/^\/+/, '')
+    .trim();
+  if (!key) return { error: 'url_error' };
+
+  // 3) Sign URL
+  const { data: signed, error: sErr } = await supabase.storage
+    .from('User-Documents')
+    .createSignedUrl(key, ttlSeconds);
+
+  if (sErr || !signed?.signedUrl) return { error: 'url_error' };
+
+  // 4) Return consistent payload
+  return {
+    signedUrl: signed.signedUrl,
+    doc: { id: doc.id, fileName: doc.fileName, path_of_file: doc.path_of_file }
+  };
 }
 
 async function moveToTrash(supabase, userId, doc) {
@@ -71,7 +104,8 @@ async function moveToTrash(supabase, userId, doc) {
 
 const upload = multer({ storage: multer.memoryStorage() });
 
-// For document upload
+// ===================== Upload =====================
+
 exports.uploadDocumentMiddleware = upload.array('document', 2);
 
 exports.uploadUserDocs = catchAsync(async (req, res, next) => {
@@ -136,6 +170,8 @@ exports.uploadUserDocs = catchAsync(async (req, res, next) => {
   });
 });
 
+// ===================== List =====================
+
 exports.getUserDocs = catchAsync(async (req, res, next) => {
   const { data: userDocs, error: userDocsError } = await supabase
     .from('UserDocuments')
@@ -148,18 +184,29 @@ exports.getUserDocs = catchAsync(async (req, res, next) => {
   res.status(200).json({ status: 'success', data: { userDocs } });
 });
 
+// ===================== Open/Download (Owner) =====================
+
 exports.openUserDocument = catchAsync(async (req, res, next) => {
   const userId = req.user.id;
   const docId = req.params.docId;
   if (!docId) return next(new AppError('Document Id is required', 400));
 
   const result = await getSignedUrlForDoc(userId, docId, 60 * 10);
-  if (result.error === 'Not_found')
-    return next(new AppError('Document not found', 400));
-  if (result.error === 'url_error')
-    return next(new AppError('Unable to generate file access URL.', 400));
 
-  const ext = path.extname(result.doc.fileName).toLowerCase();
+  if (result?.error === 'Not_found' || result?.error === 'not_found') {
+    return next(new AppError('Document not found or unauthorized', 404));
+  }
+  if (result?.error === 'url_error') {
+    return next(new AppError('Unable to generate file access URL.', 500));
+  }
+  if (!result || !result.signedUrl) {
+    console.warn('[openUserDocument] unexpected result:', result);
+    return next(new AppError('Failed to open document (no signed URL)', 500));
+  }
+
+  const fileName = result?.doc?.fileName || result?.fileName || '';
+  const ext = fileName ? path.extname(fileName).toLowerCase() : '';
+
   const googleDocViewer = {
     '.pdf': (url) => url,
     '.doc': (url) =>
@@ -204,7 +251,9 @@ exports.openUserDocument = catchAsync(async (req, res, next) => {
   const openUrl = googleDocViewer[ext]
     ? googleDocViewer[ext](result.signedUrl)
     : result.signedUrl;
-  res.status(200).json({ status: 'success', openUrl });
+  return res
+    .status(200)
+    .json({ status: 'success', openUrl, fileName: fileName || null });
 });
 
 exports.downloadUserDoc = catchAsync(async (req, res, next) => {
@@ -213,17 +262,16 @@ exports.downloadUserDoc = catchAsync(async (req, res, next) => {
   if (!docId) return next(new AppError('Document Id is required', 400));
 
   const result = await getSignedUrlForDoc(userId, docId, 60 * 10);
-  if (result.error === 'not_found')
-    return next(new AppError('Document not found or unauthorized', 400));
+  if (result.error === 'Not_found' || result.error === 'not_found')
+    return next(new AppError('Document not found or unauthorized', 404));
   if (result.error === 'url_error')
-    return next(new AppError('Unable to generate file access URL.', 400));
+    return next(new AppError('Unable to generate file access URL.', 500));
 
   return res.redirect(302, result.signedUrl);
 });
 
-// ====== SHARE PIPELINE (UPDATED) ======
+// ===================== Share Pipeline =====================
 
-// controller/userDocController.js (inside exports.shareUserDocument)
 exports.shareUserDocument = catchAsync(async (req, res, next) => {
   const userId = req.user.id;
   const docId = req.params.docId;
@@ -264,7 +312,7 @@ exports.shareUserDocument = catchAsync(async (req, res, next) => {
   }
 
   // Generate and store a signed URL for this share (longer TTL, e.g., 24h)
-  const TTL_SECONDS = 60 * 60 * 24; // 24 hours
+  const TTL_SECONDS = 60 * 60 * 24;
   const { data: signedUrlData, error: signedErr } = await supabase.storage
     .from('User-Documents')
     .createSignedUrl(doc.path_of_file, TTL_SECONDS);
@@ -288,7 +336,6 @@ exports.shareUserDocument = catchAsync(async (req, res, next) => {
 
   const shareLink = generateShareLink(shareId);
 
-  // IMPORTANT: Stash values and continue; do NOT respond here
   res.locals.share = {
     shareId,
     shareLink,
@@ -302,7 +349,6 @@ exports.shareUserDocument = catchAsync(async (req, res, next) => {
   return next();
 });
 
-// helper: normalize emails
 function normalizeEmails(input) {
   if (typeof input === 'string') {
     return input
@@ -322,7 +368,6 @@ function normalizeEmails(input) {
   return [];
 }
 
-// sharedTo as middleware: update DB, set res.locals.sharedTo, next()
 exports.sharedTo = catchAsync(async (req, res, next) => {
   const docId = req.params.docId || res.locals.docId;
   let { emails, access = 'viewer' } = req.body || {};
@@ -384,7 +429,6 @@ exports.sharedTo = catchAsync(async (req, res, next) => {
   return next();
 });
 
-// sharedFrom as middleware: update DB, set res.locals.sharedFrom, next()
 exports.sharedFrom = catchAsync(async (req, res, next) => {
   const docId = req.params.docId || res.locals.docId;
   let { emails } = req.body || {};
@@ -434,7 +478,6 @@ exports.sharedFrom = catchAsync(async (req, res, next) => {
   return next();
 });
 
-// Final responder — single JSON
 exports.runPostShareHooks = catchAsync(async (req, res, next) => {
   return res.status(200).json({
     status: 'success',
@@ -446,7 +489,7 @@ exports.runPostShareHooks = catchAsync(async (req, res, next) => {
   });
 });
 
-// ====== TRASH / RESTORE / DELETE / RENAME (unchanged below except for existing functions) ======
+// ===================== Trash / Restore / Delete / Rename =====================
 
 exports.deleteUserDocTemp = catchAsync(async (req, res, next) => {
   const userId = req.user.id;
@@ -893,7 +936,8 @@ exports.renameUserDoc = catchAsync(async (req, res, next) => {
   });
 });
 
-// controller/userDocController.js
+// ===================== Shares (Access/List) =====================
+
 exports.accessSharedDoc = catchAsync(async (req, res, next) => {
   const shareId = req.params.shareId;
 
@@ -920,7 +964,6 @@ exports.accessSharedDoc = catchAsync(async (req, res, next) => {
     return next(new AppError('Access Restricted, request required', 401));
   }
 
-  // Serve stored signed URL (no storage call here)
   const now = Date.now();
   if (
     !share.signed_url ||
@@ -938,7 +981,6 @@ exports.accessSharedDoc = catchAsync(async (req, res, next) => {
   });
 });
 
-// List docs where current user is the owner and has shared to someone (sharedTo not empty)
 exports.listSharedTo = catchAsync(async (req, res, next) => {
   const userId = req.user.id;
 
@@ -946,43 +988,33 @@ exports.listSharedTo = catchAsync(async (req, res, next) => {
     .from('UserDocuments')
     .select('*')
     .eq('uid', userId)
-    .neq('sharedTo', '{}') // non-empty uuid[]; Supabase returns '{}' for empty
+    .neq('sharedTo', '{}')
     .order('updated_at', { ascending: false });
 
   if (error) return next(new AppError(error.message, 400));
 
-  res.status(200).json({
-    status: 'success',
-    data: { docs: data || [] }
-  });
+  res.status(200).json({ status: 'success', data: { docs: data || [] } });
 });
 
-// List docs where current user is a recipient (their id is contained in sharedTo)
 exports.listSharedFrom = catchAsync(async (req, res, next) => {
   const userId = req.user.id;
 
-  // Use contains operator to check uuid in uuid[]
   const { data, error } = await supabase
     .from('UserDocuments')
     .select('*')
-    .contains('sharedTo', [userId]) // array contains userId
+    .contains('sharedTo', [userId])
     .order('updated_at', { ascending: false });
 
   if (error) return next(new AppError(error.message, 400));
 
-  res.status(200).json({
-    status: 'success',
-    data: { docs: data || [] }
-  });
+  res.status(200).json({ status: 'success', data: { docs: data || [] } });
 });
 
-// controller/userDocController.js
 exports.openViaStoredShare = catchAsync(async (req, res, next) => {
   const requesterId = req.user.id;
   const docId = req.params.docId;
   if (!docId) return next(new AppError('Document Id is required', 400));
 
-  // Fetch doc
   const { data: doc, error: docErr } = await supabase
     .from('UserDocuments')
     .select('id, uid, sharedTo, fileName, status')
@@ -993,14 +1025,12 @@ exports.openViaStoredShare = catchAsync(async (req, res, next) => {
   if (doc.status === 'trashed')
     return next(new AppError('File is in Trash', 403));
 
-  // Authorization: owner or recipient
   const isOwner = doc.uid === requesterId;
   const isRecipient =
     Array.isArray(doc.sharedTo) && doc.sharedTo.includes(requesterId);
   if (!isOwner && !isRecipient)
     return next(new AppError('Not authorized to open this file', 403));
 
-  // Get latest non-restricted share that has a stored signed_url
   const { data: shares, error: sErr } = await supabase
     .from('documentshares')
     .select('id, signed_url, expires_at, share_type, created_at')
@@ -1022,67 +1052,10 @@ exports.openViaStoredShare = catchAsync(async (req, res, next) => {
     return next(new AppError('Share link expired. Ask owner to refresh.', 410));
   }
 
-  return res.status(200).json({
-    status: 'success',
-    openUrl: share.signed_url
-  });
+  return res.status(200).json({ status: 'success', openUrl: share.signed_url });
 });
 
-// controller/userDocController.js
-exports.openViaStoredShare = catchAsync(async (req, res, next) => {
-  const requesterId = req.user.id;
-  const docId = req.params.docId;
-  if (!docId) return next(new AppError('Document Id is required', 400));
-
-  // Fetch doc
-  const { data: doc, error: docErr } = await supabase
-    .from('UserDocuments')
-    .select('id, uid, sharedTo, fileName, status')
-    .eq('id', docId)
-    .single();
-
-  if (docErr || !doc) return next(new AppError('Document not found', 404));
-  if (doc.status === 'trashed')
-    return next(new AppError('File is in Trash', 403));
-
-  // Authorization: owner or recipient
-  const isOwner = doc.uid === requesterId;
-  const isRecipient =
-    Array.isArray(doc.sharedTo) && doc.sharedTo.includes(requesterId);
-  if (!isOwner && !isRecipient)
-    return next(new AppError('Not authorized to open this file', 403));
-
-  // Get latest non-restricted share that has a stored signed_url
-  const { data: shares, error: sErr } = await supabase
-    .from('documentshares')
-    .select('id, signed_url, expires_at, share_type, created_at')
-    .eq('doc_id', docId)
-    .neq('share_type', 'restricted')
-    .order('created_at', { ascending: false })
-    .limit(1);
-
-  if (sErr || !shares || shares.length === 0) {
-    return next(new AppError('No active share URL available', 404));
-  }
-
-  const share = shares[0];
-  const now = Date.now();
-  if (
-    !share.signed_url ||
-    (share.expires_at && new Date(share.expires_at).getTime() <= now)
-  ) {
-    return next(new AppError('Share link expired. Ask owner to refresh.', 410));
-  }
-
-  return res.status(200).json({
-    status: 'success',
-    openUrl: share.signed_url
-  });
-});
-
-// In controller/userDocController.js
-// Backend handler to remove sharing from "Shared to others" (owner) or "Shared with me" (recipient).
-// Route to add: router.delete('/removeShare/:docId', userDocController.removeShare);
+// ===================== Remove Share =====================
 
 exports.removeShare = catchAsync(async (req, res, next) => {
   const requesterId = req.user.id;
@@ -1091,7 +1064,6 @@ exports.removeShare = catchAsync(async (req, res, next) => {
 
   if (!docId) return next(new AppError('docId is required', 400));
 
-  // Fetch document with ownership and current sharedTo
   const { data: doc, error: docErr } = await supabase
     .from('UserDocuments')
     .select('id, uid, sharedTo')
@@ -1103,10 +1075,8 @@ exports.removeShare = catchAsync(async (req, res, next) => {
 
   const isOwner = doc.uid === requesterId;
 
-  // Infer mode if not provided
   if (!mode) mode = isOwner ? 'owner' : 'recipient';
 
-  // OWNER MODE: remove all recipients or a specific set from sharedTo.
   if (mode === 'owner') {
     if (!isOwner)
       return next(
@@ -1120,25 +1090,21 @@ exports.removeShare = catchAsync(async (req, res, next) => {
       const removeSet = new Set(recipients);
       updatedSharedTo = current.filter((id) => !removeSet.has(id));
     } else {
-      // If no recipients provided, clear all
       updatedSharedTo = [];
     }
 
-    // Update document.sharedTo
     const { error: updErr } = await supabase
       .from('UserDocuments')
       .update({ sharedTo: updatedSharedTo })
       .eq('id', docId);
     if (updErr) return next(new AppError(updErr.message, 400));
 
-    // Optionally clear non-restricted public shares for this doc (invalidate stored signed URLs)
     const { error: delSharesErr } = await supabase
       .from('documentshares')
       .delete()
       .eq('doc_id', docId)
       .neq('share_type', 'restricted');
 
-    // Not fatal if deletion fails; proceed
     return res.status(200).json({
       status: 'success',
       data: {
@@ -1150,11 +1116,9 @@ exports.removeShare = catchAsync(async (req, res, next) => {
     });
   }
 
-  // RECIPIENT MODE: remove the requester from sharedTo (so it disappears from "Shared with me").
   if (mode === 'recipient') {
     const current = Array.isArray(doc.sharedTo) ? doc.sharedTo : [];
 
-    // If already not shared, return success for idempotency
     if (!current.includes(requesterId)) {
       return res.status(200).json({
         status: 'success',
@@ -1180,6 +1144,5 @@ exports.removeShare = catchAsync(async (req, res, next) => {
     });
   }
 
-  // Unknown mode
   return next(new AppError('Invalid mode. Use "owner" or "recipient".', 400));
 });
