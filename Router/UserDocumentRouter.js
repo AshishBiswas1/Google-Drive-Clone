@@ -6,7 +6,26 @@ const router = express.Router();
 
 router.use(authController.protect);
 
-router.route('/share').post(userDocController.shareUserDocument);
+// After authController.protect
+router.get('/shared-to', userDocController.listSharedTo);
+router.get('/shared-from', userDocController.listSharedFrom);
+
+router.route('/openShared/:docId').get(userDocController.openViaStoredShare);
+
+router.route('/removeShare/:docId').delete(userDocController.removeShare);
+
+router.post(
+  '/share',
+  userDocController.shareUserDocument,
+  userDocController.runPostShareHooks
+);
+
+router.route('/share/doc/:docId').post(
+  userDocController.shareUserDocument, // sets res.locals.share + res.locals.docId; next()
+  userDocController.sharedTo, // updates sharedTo; sets res.locals.sharedTo; next()
+  userDocController.sharedFrom, // updates sharedFrom; sets res.locals.sharedFrom; next()
+  userDocController.runPostShareHooks // sends final JSON with all details
+);
 
 router.route('/share/:shareId').get(userDocController.accessSharedDoc);
 
@@ -37,6 +56,8 @@ router.route('/restore/batch/:docIds').post(userDocController.restoreUserDoc);
 router.route('/rename/:docId').patch(userDocController.renameUserDoc);
 
 router.route('/getDeleted').get(userDocController.getdeletedDocs);
+
+router.route('/share/emails/:docId').post(userDocController.sharedTo);
 
 router
   .route('/upload')

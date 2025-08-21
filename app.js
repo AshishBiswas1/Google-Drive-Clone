@@ -4,6 +4,7 @@ const morgan = require('morgan');
 const helmet = require('helmet');
 const xss = require('xss-clean');
 const cookieParser = require('cookie-parser');
+const cors = require('cors');
 
 const userRouter = require('./Router/userRouter');
 const userDocumentRouter = require('./Router/UserDocumentRouter');
@@ -12,6 +13,14 @@ const AppError = require('./util/appError');
 
 const app = express();
 
+app.use(
+  cors({
+    origin: 'http://localhost:3000',
+    credentials: true,
+    methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization']
+  })
+);
 if (process.env.NODE_ENV === 'development') {
   app.use(morgan('dev'));
 }

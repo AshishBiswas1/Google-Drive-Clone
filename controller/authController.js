@@ -8,7 +8,11 @@ const createSendToken = (user, access_token, statusCode, res) => {
     expires: new Date(
       Date.now() + process.env.JWT_COOKIE_EXPIRES_IN * 24 * 60 * 60 * 1000
     ),
-    httpOnly: true
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'lax',
+    path: '/',
+    maxAge: 7 * 24 * 60 * 60 * 1000
   };
 
   if (process.env.NODE_ENV === 'production') cookieOptions.secure = true;
@@ -289,4 +293,16 @@ exports.updatePassword = catchAsync(async (req, res, next) => {
   const user = newSessionData.user;
 
   createSendToken(user, accessToken, 200, res);
+});
+
+exports.logout = catchAsync(async (req, res, next) => {
+  res.cookie('jwt', '', {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'lax',
+    path: '/',
+    maxAge: 0
+  });
+
+  return res.status(200).json({ status: 'success', message: 'Logged out' });
 });
